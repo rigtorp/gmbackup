@@ -208,6 +208,7 @@ func main() {
 	dryRun := flag.BoolP("dry-run", "n", false, "Don't make any changes")
 	user := flag.StringP("user", "u", "me", "Gmail account to backup")
 	verbose := flag.BoolP("verbose", "v", false, "")
+	incremental := flag.BoolP("incremental", "i", false, "Stop fetching on first existing mail, won't detect deletes")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of %s: [DESTINATION]\n", os.Args[0])
@@ -294,6 +295,8 @@ func main() {
 						log.Fatalf("Unable to retrieve message: %v: %v", m.Id, err)
 					}
 				}
+			} else if *incremental {
+				return
 			}
 
 			processed += 1
