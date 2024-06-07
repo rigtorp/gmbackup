@@ -209,6 +209,7 @@ func main() {
 	user := flag.StringP("user", "u", "me", "Gmail account to backup")
 	verbose := flag.BoolP("verbose", "v", false, "")
 	incremental := flag.BoolP("incremental", "i", false, "Stop fetching on first existing mail, won't detect deletes")
+	useServiceAccount := flag.StringP("service-account", "s", "", "Use a service account with delegation setup instead of OAuth (only usable for google workspace)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of %s: [DESTINATION]\n", os.Args[0])
@@ -239,27 +240,47 @@ func main() {
 		log.Fatalf("U: %v", err)
 	}
 
-	credentialsPath := filepath.Join(userConfigDir, "gmbackup", "credentials.json")
-	b, err := os.ReadFile(credentialsPath)
-	config := &defaultConfig
-	if err != nil {
-		if *verbose {
-			log.Printf("Unable to read client secret file: %v", err)
-			log.Println("Using default client credentials")
-		}
-	} else {
-		config, err = google.ConfigFromJSON(b, gmail.GmailReadonlyScope)
+	var client option.ClientOption
+	if useServiceAccount == nil || *useServiceAccount == "" {
+
+		credentialsPath := filepath.Join(userConfigDir, "gmbackup", "credentials.json")
+		b, err := os.ReadFile(credentialsPath)
+		config := &defaultConfig
 		if err != nil {
-			log.Fatalf("Unable to parse client secret file to config: %v", err)
+			if *verbose {
+				log.Printf("Unable to read client secret file: %v", err)
+				log.Println("Using default client credentials")
+			}
+		} else {
+			config, err = google.ConfigFromJSON(b, gmail.GmailReadonlyScope)
+			if err != nil {
+				log.Fatalf("Unable to parse client secret file to config: %v", err)
+			}
+			if *verbose {
+				log.Printf("Using client credentials from: %v", credentialsPath)
+			}
 		}
+
+		client = option.WithHTTPClient(createClient(config))
+	} else {
+		s, err := os.ReadFile(*useServiceAccount)
+		if err != nil {
+			log.Fatalf("Unable to read service account file: %v", err)
+		}
+		config, err := google.JWTConfigFromJSON(s, gmail.GmailReadonlyScope)
+		if err != nil {
+			log.Fatalf("Unable to parse service account file: %v", err)
+		}
+		config.Subject = *user
+
 		if *verbose {
-			log.Printf("Using client credentials from: %v", credentialsPath)
+			log.Printf("Using service account file: %v", *useServiceAccount)
 		}
+
+		client = option.WithTokenSource(config.TokenSource(ctx))
 	}
 
-	client := createClient(config)
-
-	svc, err := gmail.NewService(ctx, option.WithHTTPClient(client))
+	svc, err := gmail.NewService(ctx, client)
 	if err != nil {
 		log.Fatalf("Unable to retrieve Gmail client: %v", err)
 	}
