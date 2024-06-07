@@ -180,13 +180,14 @@ func downloadMessage(svc *gmail.Service, id string, user string, outputPath stri
 		return err
 	}
 
-	path := filepath.Join(outputPath, id)
-	err = os.Rename(f.Name(), path)
+	tmpName := f.Name()
+	err = f.Close()
 	if err != nil {
 		return err
 	}
 
-	err = f.Close()
+	path := filepath.Join(outputPath, id)
+	err = os.Rename(tmpName, path)
 	if err != nil {
 		return err
 	}
