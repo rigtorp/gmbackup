@@ -11,17 +11,36 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
-	"github.com/skratchdot/open-golang/open"
 	flag "github.com/spf13/pflag"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/gmail/v1"
 	"google.golang.org/api/option"
 )
+
+// openBrowser is a cross-platform helper to open a url in the default browser
+func openBrowser(url string) error {
+	var cmd string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "cmd"
+		args = []string{"/c", "start"}
+	case "darwin":
+		cmd = "open"
+	default: // "linux", "freebsd", "openbsd", "netbsd"
+		cmd = "xdg-open"
+	}
+	args = append(args, url)
+	return exec.Command(cmd, args...).Start()
+}
 
 // Retrieve a token, saves the token, then returns the generated client.
 func createClient(config *oauth2.Config) *http.Client {
@@ -83,7 +102,7 @@ func tokenFromWeb(config *oauth2.Config) *oauth2.Token {
 	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
 
 	fmt.Printf("Go to the following link in your browser to authorize: \n%v\n", authURL)
-	if err := open.Start(authURL); err != nil {
+	if err := openBrowser(authURL); err != nil {
 		log.Printf("Failed to open browser: %v", err)
 	}
 
