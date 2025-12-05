@@ -2,11 +2,11 @@ package main
 
 import (
 	"context"
-	_ "embed"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -42,6 +42,22 @@ func openBrowser(url string) error {
 	return exec.Command(cmd, args...).Start()
 }
 
+// generateRandomString creates a URL-safe, unpadded base64 random string
+func generateRandomString(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	// OAuth2 specs require "Raw" (no padding) URL encoding
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// generateCodeChallenge implements the S256 transformation
+func generateCodeChallenge(verifier string) string {
+	s := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(s[:])
+}
+
 // Retrieve a token, saves the token, then returns the generated client.
 func createClient(config *oauth2.Config) *http.Client {
 	userCacheDir, err := os.UserCacheDir()
@@ -63,59 +79,97 @@ func createClient(config *oauth2.Config) *http.Client {
 
 // Request a token from the web, then returns the retrieved token.
 func tokenFromWeb(config *oauth2.Config) *oauth2.Token {
+	ctx := context.Background()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		log.Fatalf("Failed to listen: %v", err)
 	}
 
-	config.RedirectURL = fmt.Sprintf("http://%v", listener.Addr().String())
+	config.RedirectURL = fmt.Sprintf("http://%v/callback", listener.Addr().String())
 
-	var tok2 *oauth2.Token
-	var err2 error
+	// 5. PKCE Generation (Verifier & Challenge)
+	verifier, err := generateRandomString(32)
+	if err != nil {
+		log.Fatalf("Failed to generate verifier: %v", err)
+	}
+	challenge := generateCodeChallenge(verifier)
+	state, err := generateRandomString(16)
+	if err != nil {
+		log.Fatalf("Failed to generate state: %v", err)
+	}
 
-	server := &http.Server{}
+	// 6. Define the handler logic
+	codeChan := make(chan string)
+	errChan := make(chan error)
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+		// A. Validate State
+		if r.URL.Query().Get("state") != state {
+			http.Error(w, "State mismatch", http.StatusBadRequest)
+			errChan <- fmt.Errorf("state mismatch")
+			return
+		}
+
+		// B. Get Code
 		code := r.URL.Query().Get("code")
 		if code == "" {
-			err2 = fmt.Errorf("URL parameter 'code' is missing")
-			io.WriteString(w, "Error: could not find 'code' URL parameter\n")
-			go server.Close()
+			http.Error(w, "Code not found", http.StatusBadRequest)
+			errChan <- fmt.Errorf("code not found")
 			return
 		}
 
-		tok, err := config.Exchange(context.TODO(), code)
-		if err != nil {
-			err2 = fmt.Errorf("unable to retrieve token: %v", err)
-			io.WriteString(w, "Error: could not retrieve token\n")
-			go server.Close()
-			return
-		}
-
-		io.WriteString(w, "Login successful!\nYou can now close this window.\n")
-
-		go server.Close()
-		tok2 = tok
+		w.Write([]byte("Authentication successful! You can close this tab."))
+		codeChan <- code
 	})
 
-	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
-
-	fmt.Printf("Go to the following link in your browser to authorize: \n%v\n", authURL)
-	if err := openBrowser(authURL); err != nil {
-		log.Printf("Failed to open browser: %v", err)
+	server := &http.Server{
+		Handler: mux,
 	}
 
-	err = server.Serve(listener)
-	if err2 == nil && tok2 == nil {
-		log.Fatalf("Error waiting for authorization callback: %v", err)
+	// 7. Start the server using the EXISTING listener
+	// We use Serve() instead of ListenAndServe() because we already have the listener.
+	go func() {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			errChan <- err
+		}
+	}()
+
+	// 8. Open Browser
+	// We construct the Auth URL *after* we know the redirect URL
+	authUrl := config.AuthCodeURL(
+		state,
+		oauth2.SetAuthURLParam("code_challenge", challenge),
+		oauth2.SetAuthURLParam("code_challenge_method", "S256"),
+		oauth2.AccessTypeOffline,
+	)
+
+	fmt.Printf("Opening browser: %s\n", authUrl)
+	if err := openBrowser(authUrl); err != nil {
+		fmt.Printf("Failed to open browser: %v\n", err)
 	}
 
-	if err2 != nil {
-		log.Fatalf("Authorization failed: %v", err2)
+	// 9. Wait for Code
+	var authCode string
+	select {
+	case authCode = <-codeChan:
+	case err := <-errChan:
+		log.Fatalf("Callback error: %v", err)
+	case <-time.After(5 * time.Minute):
+		log.Fatal("Timeout waiting for authentication")
 	}
 
-	return tok2
+	// 10. Shutdown
+	server.Shutdown(ctx)
+
+	// 11. Exchange
+	token, err := config.Exchange(ctx, authCode, oauth2.VerifierOption(verifier))
+	if err != nil {
+		log.Fatalf("Token exchange failed: %v", err)
+	}
+
+	return token
 }
 
 // Retrieves a token from a local file.
