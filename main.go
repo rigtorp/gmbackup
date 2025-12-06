@@ -306,12 +306,78 @@ var defaultConfig = oauth2.Config{
 	Scopes:       []string{gmail.GmailReadonlyScope},
 }
 
+var delete = flag.BoolP("delete", "d", false, "Delete local mail that has been deleted in Gmail")
+var dryRun = flag.BoolP("dry-run", "n", false, "Don't make any changes")
+var user = flag.StringP("user", "u", "me", "Gmail account to backup")
+var verbose = flag.BoolP("verbose", "v", false, "")
+var incremental = flag.BoolP("incremental", "i", false, "Stop fetching on first existing mail, won't detect deletes")
+
+func sync(svc *gmail.Service, outputPath string) error {
+	localMails, err := readdir(outputPath)
+	if err != nil {
+		return fmt.Errorf("unable to list local messages: %w", err)
+	}
+
+	remoteMails := make(map[string]bool)
+	pageToken := ""
+	for {
+		req := svc.Users.Messages.List(*user).MaxResults(500)
+		if pageToken != "" {
+			req.PageToken(pageToken)
+		}
+		r, err := req.Do()
+		if err != nil {
+			return fmt.Errorf("unable to list remote messages: %w", err)
+		}
+
+		for _, m := range r.Messages {
+			remoteMails[m.Id] = true
+
+			if localMails[m.Id] == nil {
+				if *verbose {
+					log.Printf("Downloading %v", m.Id)
+				}
+				if !*dryRun {
+					err = downloadMessage(svc, m.Id, *user, outputPath)
+					if err != nil {
+						return fmt.Errorf("unable to retrieve message: %s: %w", m.Id, err)
+					}
+				}
+			} else if *incremental {
+				return nil
+			}
+		}
+
+		if r.NextPageToken == "" {
+			break
+		}
+		pageToken = r.NextPageToken
+	}
+
+	if *delete {
+		for k := range localMails {
+			if !remoteMails[k] {
+				if strings.HasPrefix(k, ".") {
+					continue
+				}
+				if *verbose {
+					log.Printf("Deleting %v", k)
+				}
+				if !*dryRun {
+					path := filepath.Join(outputPath, k)
+					err := os.Remove(path)
+					if err != nil {
+						return fmt.Errorf("delete failed: %w", err)
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 func main() {
-	delete := flag.BoolP("delete", "d", false, "Delete local mail that has been deleted in Gmail")
-	dryRun := flag.BoolP("dry-run", "n", false, "Don't make any changes")
-	user := flag.StringP("user", "u", "me", "Gmail account to backup")
-	verbose := flag.BoolP("verbose", "v", false, "")
-	incremental := flag.BoolP("incremental", "i", false, "Stop fetching on first existing mail, won't detect deletes")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage of %s: [DESTINATION]\n", os.Args[0])
@@ -370,67 +436,8 @@ func main() {
 		log.Fatalf("Unable to retrieve Gmail client: %v", err)
 	}
 
-	localMails, err := readdir(outputPath)
+	err = sync(svc, outputPath)
 	if err != nil {
-		log.Fatalf("Unable to list local messages: %v", err)
-	}
-
-	remoteMails := make(map[string]bool)
-	var processed int64
-	pageToken := ""
-	for {
-		req := svc.Users.Messages.List(*user).MaxResults(500).Q("-in:CHAT")
-		if pageToken != "" {
-			req.PageToken(pageToken)
-		}
-		r, err := req.Do()
-		if err != nil {
-			log.Fatalf("Unable to list remote messages: %v", err)
-		}
-
-		for _, m := range r.Messages {
-			remoteMails[m.Id] = true
-
-			if localMails[m.Id] == nil {
-				if *verbose {
-					log.Printf("Downloading %v", m.Id)
-				}
-				if !*dryRun {
-					err = downloadMessage(svc, m.Id, *user, outputPath)
-					if err != nil {
-						log.Fatalf("Unable to retrieve message: %v: %v", m.Id, err)
-					}
-				}
-			} else if *incremental {
-				return
-			}
-
-			processed += 1
-		}
-
-		if r.NextPageToken == "" {
-			break
-		}
-		pageToken = r.NextPageToken
-	}
-
-	if *delete {
-		for k := range localMails {
-			if !remoteMails[k] {
-				if strings.HasPrefix(k, ".") {
-					continue
-				}
-				if *verbose {
-					log.Printf("Deleting %v", k)
-				}
-				if !*dryRun {
-					path := filepath.Join(outputPath, k)
-					err := os.Remove(path)
-					if err != nil {
-						log.Fatalf("Delete failed: %v", err)
-					}
-				}
-			}
-		}
+		log.Fatalf("Unable to sync: %v", err)
 	}
 }
