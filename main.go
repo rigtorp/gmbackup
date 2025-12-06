@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -77,9 +78,7 @@ func tokenFromFile(file string) (tok *oauth2.Token, err error) {
 }
 
 // Request a token from the web, then returns the retrieved token.
-func tokenFromWeb(config *oauth2.Config) (*oauth2.Token, error) {
-	ctx := context.Background()
-
+func tokenFromWeb(ctx context.Context, config *oauth2.Config) (*oauth2.Token, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen: %w", err)
@@ -193,7 +192,7 @@ func saveToken(path string, token *oauth2.Token) error {
 }
 
 // Retrieve a token, saves the token, then returns the generated client.
-func createClient(config *oauth2.Config) (*http.Client, error) {
+func createClient(ctx context.Context, config *oauth2.Config) (*http.Client, error) {
 	userCacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return nil, fmt.Errorf("failed to find user cache dir: %w", err)
@@ -202,7 +201,7 @@ func createClient(config *oauth2.Config) (*http.Client, error) {
 	tokFile := filepath.Join(userCacheDir, "gmbackup", "token.json")
 	tok, err := tokenFromFile(tokFile)
 	if os.IsNotExist(err) {
-		tok, err = tokenFromWeb(config)
+		tok, err = tokenFromWeb(ctx, config)
 		if err != nil {
 			return nil, err
 		}
@@ -213,7 +212,7 @@ func createClient(config *oauth2.Config) (*http.Client, error) {
 		return nil, fmt.Errorf("failed to load authorization token: %w", err)
 	}
 
-	return config.Client(context.Background(), tok), nil
+	return config.Client(ctx, tok), nil
 }
 
 // Writes data to a file atomically.
@@ -254,8 +253,9 @@ func atomicWrite(filename string, data []byte, mtime time.Time) error {
 	return err
 }
 
-func downloadMessage(svc *gmail.Service, id string, user string, outputPath string) error {
-	msg, err := svc.Users.Messages.Get(user, id).Format("raw").Do()
+// Downloads a single message and saves it to outputPath
+func downloadMessage(ctx context.Context, svc *gmail.Service, id string, user string, outputPath string) error {
+	msg, err := svc.Users.Messages.Get(user, id).Format("raw").Context(ctx).Do()
 	if err != nil {
 		return err
 	}
@@ -312,7 +312,7 @@ var user = flag.StringP("user", "u", "me", "Gmail account to backup")
 var verbose = flag.BoolP("verbose", "v", false, "")
 var incremental = flag.BoolP("incremental", "i", false, "Stop fetching on first existing mail, won't detect deletes")
 
-func sync(svc *gmail.Service, outputPath string) error {
+func sync(ctx context.Context, svc *gmail.Service, outputPath string) error {
 	localMails, err := readdir(outputPath)
 	if err != nil {
 		return fmt.Errorf("unable to list local messages: %w", err)
@@ -325,7 +325,7 @@ func sync(svc *gmail.Service, outputPath string) error {
 		if pageToken != "" {
 			req.PageToken(pageToken)
 		}
-		r, err := req.Do()
+		r, err := req.Context(ctx).Do()
 		if err != nil {
 			return fmt.Errorf("unable to list remote messages: %w", err)
 		}
@@ -338,7 +338,7 @@ func sync(svc *gmail.Service, outputPath string) error {
 					log.Printf("Downloading %v", m.Id)
 				}
 				if !*dryRun {
-					err = downloadMessage(svc, m.Id, *user, outputPath)
+					err = downloadMessage(ctx, svc, m.Id, *user, outputPath)
 					if err != nil {
 						return fmt.Errorf("unable to retrieve message: %s: %w", m.Id, err)
 					}
@@ -402,7 +402,9 @@ func main() {
 		outputPath = flag.Arg(0)
 	}
 
-	ctx := context.Background()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
 	userConfigDir, err := os.UserConfigDir()
 	if err != nil {
 		log.Fatalf("U: %v", err)
@@ -426,7 +428,7 @@ func main() {
 		}
 	}
 
-	client, err := createClient(config)
+	client, err := createClient(ctx, config)
 	if err != nil {
 		log.Fatalf("Unable to create client: %v", err)
 	}
@@ -436,7 +438,7 @@ func main() {
 		log.Fatalf("Unable to retrieve Gmail client: %v", err)
 	}
 
-	err = sync(svc, outputPath)
+	err = sync(ctx, svc, outputPath)
 	if err != nil {
 		log.Fatalf("Unable to sync: %v", err)
 	}
