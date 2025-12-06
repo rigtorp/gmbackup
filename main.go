@@ -1,3 +1,6 @@
+// Copyright © 2023-2025 Erik Rigtorp <erik@rigtorp.se>
+// SPDX-License-Identifier: MIT
+
 package main
 
 import (
@@ -24,7 +27,7 @@ import (
 	"google.golang.org/api/option"
 )
 
-// openBrowser is a cross-platform helper to open a url in the default browser
+// A cross-platform helper to open a url in the default browser
 func openBrowser(url string) error {
 	var cmd string
 	var args []string
@@ -42,7 +45,7 @@ func openBrowser(url string) error {
 	return exec.Command(cmd, args...).Start()
 }
 
-// generateRandomString creates a URL-safe, unpadded base64 random string
+// Creates a URL-safe, unpadded base64 random string
 func generateRandomString(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -52,67 +55,60 @@ func generateRandomString(n int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-// generateCodeChallenge implements the S256 transformation
+// Implements the S256 transformation
 func generateCodeChallenge(verifier string) string {
 	s := sha256.Sum256([]byte(verifier))
 	return base64.RawURLEncoding.EncodeToString(s[:])
 }
 
-// Retrieve a token, saves the token, then returns the generated client.
-func createClient(config *oauth2.Config) *http.Client {
-	userCacheDir, err := os.UserCacheDir()
+// Retrieves a token from a local file.
+func tokenFromFile(file string) (tok *oauth2.Token, err error) {
+	f, err := os.Open(file)
 	if err != nil {
-		log.Fatalf("Failed to find user cache dir: %v", err)
+		return nil, err
 	}
+	defer func() {
+		_ = f.Close()
+	}()
 
-	tokFile := filepath.Join(userCacheDir, "gmbackup", "token.json")
-	tok, err := tokenFromFile(tokFile)
-	if os.IsNotExist(err) {
-		tok = tokenFromWeb(config)
-		saveToken(tokFile, tok)
-	} else if err != nil {
-		log.Fatalf("Failed to load authorization token: %v", err)
-	}
-
-	return config.Client(context.Background(), tok)
+	tok = &oauth2.Token{}
+	err = json.NewDecoder(f).Decode(tok)
+	return tok, err
 }
 
 // Request a token from the web, then returns the retrieved token.
-func tokenFromWeb(config *oauth2.Config) *oauth2.Token {
+func tokenFromWeb(config *oauth2.Config) (*oauth2.Token, error) {
 	ctx := context.Background()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
+		return nil, fmt.Errorf("failed to listen: %w", err)
 	}
 
 	config.RedirectURL = fmt.Sprintf("http://%v/callback", listener.Addr().String())
 
-	// 5. PKCE Generation (Verifier & Challenge)
+	// PKCE Generation (Verifier & Challenge)
 	verifier, err := generateRandomString(32)
 	if err != nil {
-		log.Fatalf("Failed to generate verifier: %v", err)
+		return nil, fmt.Errorf("failed to generate verifier: %w", err)
 	}
 	challenge := generateCodeChallenge(verifier)
 	state, err := generateRandomString(16)
 	if err != nil {
-		log.Fatalf("Failed to generate state: %v", err)
+		return nil, fmt.Errorf("failed to generate state: %w", err)
 	}
 
-	// 6. Define the handler logic
 	codeChan := make(chan string)
 	errChan := make(chan error)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		// A. Validate State
 		if r.URL.Query().Get("state") != state {
 			http.Error(w, "State mismatch", http.StatusBadRequest)
 			errChan <- fmt.Errorf("state mismatch")
 			return
 		}
 
-		// B. Get Code
 		code := r.URL.Query().Get("code")
 		if code == "" {
 			http.Error(w, "Code not found", http.StatusBadRequest)
@@ -120,7 +116,11 @@ func tokenFromWeb(config *oauth2.Config) *oauth2.Token {
 			return
 		}
 
-		w.Write([]byte("Authentication successful! You can close this tab."))
+		if _, err := w.Write([]byte("Authentication successful! You can close this tab.")); err != nil {
+			errChan <- fmt.Errorf("failed to write response: %w", err)
+			return
+		}
+
 		codeChan <- code
 	})
 
@@ -128,15 +128,12 @@ func tokenFromWeb(config *oauth2.Config) *oauth2.Token {
 		Handler: mux,
 	}
 
-	// 7. Start the server using the EXISTING listener
-	// We use Serve() instead of ListenAndServe() because we already have the listener.
 	go func() {
 		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			errChan <- err
 		}
 	}()
 
-	// 8. Open Browser
 	// We construct the Auth URL *after* we know the redirect URL
 	authUrl := config.AuthCodeURL(
 		state,
@@ -145,80 +142,116 @@ func tokenFromWeb(config *oauth2.Config) *oauth2.Token {
 		oauth2.AccessTypeOffline,
 	)
 
-	fmt.Printf("Opening browser: %s\n", authUrl)
+	log.Printf("Opening browser: %s\n", authUrl)
 	if err := openBrowser(authUrl); err != nil {
-		fmt.Printf("Failed to open browser: %v\n", err)
+		log.Printf("Failed to open browser: %v\n", err)
 	}
 
-	// 9. Wait for Code
 	var authCode string
 	select {
 	case authCode = <-codeChan:
 	case err := <-errChan:
-		log.Fatalf("Callback error: %v", err)
+		return nil, fmt.Errorf("callback error: %w", err)
 	case <-time.After(5 * time.Minute):
-		log.Fatal("Timeout waiting for authentication")
+		return nil, fmt.Errorf("timeout waiting for authentication")
 	}
 
-	// 10. Shutdown
-	server.Shutdown(ctx)
+	if err := server.Shutdown(ctx); err != nil {
+		return nil, fmt.Errorf("failed to shutdown server: %w", err)
+	}
 
-	// 11. Exchange
 	token, err := config.Exchange(ctx, authCode, oauth2.VerifierOption(verifier))
 	if err != nil {
-		log.Fatalf("Token exchange failed: %v", err)
+		return nil, fmt.Errorf("token exchange failed: %w", err)
 	}
 
-	return token
-}
-
-// Retrieves a token from a local file.
-func tokenFromFile(file string) (*oauth2.Token, error) {
-	f, err := os.Open(file)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	tok := &oauth2.Token{}
-	err = json.NewDecoder(f).Decode(tok)
-	return tok, err
+	return token, nil
 }
 
 // Saves a token to a file path.
-func saveToken(path string, token *oauth2.Token) {
+func saveToken(path string, token *oauth2.Token) error {
 	dir := filepath.Dir(path)
 	err := os.MkdirAll(dir, 0700)
 	if err != nil {
-		log.Fatalf("Unable to save oauth token: %v", err)
+		return fmt.Errorf("unable to create directory for oauth token: %w", err)
 	}
 
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		log.Fatalf("Unable to save oauth token: %v", err)
+		return fmt.Errorf("unable to open file for oauth token: %w", err)
 	}
-	defer f.Close()
+	defer func() {
+		if err := f.Close(); err != nil {
+			log.Printf("Failed to close file: %v", err)
+		}
+	}()
 
-	json.NewEncoder(f).Encode(token)
+	if err := json.NewEncoder(f).Encode(token); err != nil {
+		return fmt.Errorf("failed to encode token: %w", err)
+	}
+	return nil
 }
 
-func readdir(path string) (map[string]os.FileInfo, error) {
-	f, err := os.Open(path)
+// Retrieve a token, saves the token, then returns the generated client.
+func createClient(config *oauth2.Config) (*http.Client, error) {
+	userCacheDir, err := os.UserCacheDir()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to find user cache dir: %w", err)
 	}
 
-	files, err := f.Readdir(0)
+	tokFile := filepath.Join(userCacheDir, "gmbackup", "token.json")
+	tok, err := tokenFromFile(tokFile)
+	if os.IsNotExist(err) {
+		tok, err = tokenFromWeb(config)
+		if err != nil {
+			return nil, err
+		}
+		if err := saveToken(tokFile, tok); err != nil {
+			return nil, err
+		}
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to load authorization token: %w", err)
+	}
+
+	return config.Client(context.Background(), tok), nil
+}
+
+// Writes data to a file atomically.
+func atomicWrite(filename string, data []byte, mtime time.Time) error {
+	tempFile, err := os.CreateTemp(filepath.Dir(filename), "gmbackup-")
 	if err != nil {
-		return nil, err
+		return err
+	}
+	tempName := tempFile.Name()
+
+	defer func() {
+		// Only clean up if the file hasn't been successfully renamed yet.
+		if err != nil {
+			_ = tempFile.Close()
+			_ = os.Remove(tempName)
+		}
+	}()
+
+	if _, err = tempFile.Write(data); err != nil {
+		return err
 	}
 
-	fileMap := make(map[string]os.FileInfo)
-	for _, v := range files {
-		fileMap[v.Name()] = v
+	err = tempFile.Chmod(0400)
+	if err != nil {
+		return err
 	}
 
-	return fileMap, nil
+	if err = tempFile.Close(); err != nil {
+		return err
+	}
+
+	err = os.Chtimes(tempName, time.Time{}, mtime)
+	if err != nil {
+		return err
+	}
+
+	err = os.Rename(tempName, filename)
+	return err
 }
 
 func downloadMessage(svc *gmail.Service, id string, user string, outputPath string) error {
@@ -232,39 +265,36 @@ func downloadMessage(svc *gmail.Service, id string, user string, outputPath stri
 		return err
 	}
 
-	f, err := os.CreateTemp(outputPath, "gmbackup")
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	_, err = f.Write(raw)
-	if err != nil {
-		return err
-	}
-
-	err = f.Chmod(0400)
-	if err != nil {
-		return err
-	}
-
-	err = os.Chtimes(f.Name(), time.Time{}, time.UnixMilli(msg.InternalDate))
-	if err != nil {
-		return err
-	}
-
 	path := filepath.Join(outputPath, id)
-	err = os.Rename(f.Name(), path)
-	if err != nil {
-		return err
-	}
 
-	err = f.Close()
+	err = atomicWrite(path, raw, time.UnixMilli(msg.InternalDate))
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func readdir(path string) (fileMap map[string]os.FileInfo, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	files, err := f.Readdir(0)
+	if err != nil {
+		return nil, err
+	}
+
+	fileMap = make(map[string]os.FileInfo)
+	for _, v := range files {
+		fileMap[v.Name()] = v
+	}
+
+	return fileMap, nil
 }
 
 // This secret only identifies the application, it doesn't provide access to any
@@ -330,16 +360,19 @@ func main() {
 		}
 	}
 
-	client := createClient(config)
+	client, err := createClient(config)
+	if err != nil {
+		log.Fatalf("Unable to create client: %v", err)
+	}
 
 	svc, err := gmail.NewService(ctx, option.WithHTTPClient(client))
 	if err != nil {
 		log.Fatalf("Unable to retrieve Gmail client: %v", err)
 	}
 
-	fileMap, err := readdir(outputPath)
+	localMails, err := readdir(outputPath)
 	if err != nil {
-		log.Fatalf("Unable to list messages: %v", err)
+		log.Fatalf("Unable to list local messages: %v", err)
 	}
 
 	remoteMails := make(map[string]bool)
@@ -352,13 +385,13 @@ func main() {
 		}
 		r, err := req.Do()
 		if err != nil {
-			log.Fatalf("Unable to retrieve messages: %v", err)
+			log.Fatalf("Unable to list remote messages: %v", err)
 		}
 
 		for _, m := range r.Messages {
 			remoteMails[m.Id] = true
 
-			if fileMap[m.Id] == nil {
+			if localMails[m.Id] == nil {
 				if *verbose {
 					log.Printf("Downloading %v", m.Id)
 				}
@@ -382,7 +415,7 @@ func main() {
 	}
 
 	if *delete {
-		for k := range fileMap {
+		for k := range localMails {
 			if !remoteMails[k] {
 				if strings.HasPrefix(k, ".") {
 					continue
