@@ -191,7 +191,7 @@ func saveToken(path string, token *oauth2.Token) error {
 	return nil
 }
 
-// Retrieve a token, saves the token, then returns the generated client.
+// Create a authenticated http.Client
 func createClient(ctx context.Context, config *oauth2.Config) (*http.Client, error) {
 	userCacheDir, err := os.UserCacheDir()
 	if err != nil {
@@ -213,6 +213,44 @@ func createClient(ctx context.Context, config *oauth2.Config) (*http.Client, err
 	}
 
 	return config.Client(ctx, tok), nil
+}
+
+// Create a authenticated gmail.Service
+func createService(ctx context.Context) (*gmail.Service, error) {
+	userConfigDir, err := os.UserConfigDir()
+	if err != nil {
+		return nil, fmt.Errorf("failed to find user config dir: %w", err)
+	}
+
+	credentialsPath := filepath.Join(userConfigDir, "gmbackup", "credentials.json")
+	b, err := os.ReadFile(credentialsPath)
+	config := &defaultConfig
+	if err != nil {
+		if *verbose {
+			log.Printf("Unable to read client secret file: %v", err)
+			log.Println("Using default client credentials")
+		}
+	} else {
+		config, err = google.ConfigFromJSON(b, gmail.GmailReadonlyScope)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse client secret file: %w", err)
+		}
+		if *verbose {
+			log.Printf("Using client credentials from: %v", credentialsPath)
+		}
+	}
+
+	client, err := createClient(ctx, config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create http.Client: %w", err)
+	}
+
+	svc, err := gmail.NewService(ctx, option.WithHTTPClient(client))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create gmail.Service: %w", err)
+	}
+
+	return svc, nil
 }
 
 // Writes data to a file atomically.
@@ -254,25 +292,25 @@ func atomicWrite(filename string, data []byte, mtime time.Time) error {
 }
 
 // Downloads a single message and saves it to outputPath
-func downloadMessage(ctx context.Context, svc *gmail.Service, id string, user string, outputPath string) error {
+func downloadMessage(ctx context.Context, svc *gmail.Service, id string, user string, outputPath string) (*gmail.Message, error) {
 	msg, err := svc.Users.Messages.Get(user, id).Format("raw").Context(ctx).Do()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	raw, err := base64.URLEncoding.DecodeString(msg.Raw)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	path := filepath.Join(outputPath, id)
 
 	err = atomicWrite(path, raw, time.UnixMilli(msg.InternalDate))
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return msg, nil
 }
 
 // This secret only identifies the application, it doesn't provide access to any
@@ -290,9 +328,10 @@ var user = flag.StringP("user", "u", "me", "Gmail account to backup")
 var verbose = flag.BoolP("verbose", "v", false, "")
 var incremental = flag.BoolP("incremental", "i", false, "Stop fetching on first existing mail, won't detect deletes")
 
-func sync(ctx context.Context, svc *gmail.Service, outputPath string) error {
+func sync(ctx context.Context, svc *gmail.Service, outputPath string) (uint64, error) {
 	remoteMails := make(map[string]bool)
 	pageToken := ""
+	maxHistoryId := uint64(0)
 	for {
 		req := svc.Users.Messages.List(*user).MaxResults(500).Q("-in:CHAT")
 		if pageToken != "" {
@@ -300,7 +339,7 @@ func sync(ctx context.Context, svc *gmail.Service, outputPath string) error {
 		}
 		r, err := req.Context(ctx).Do()
 		if err != nil {
-			return fmt.Errorf("unable to list remote messages: %w", err)
+			return maxHistoryId, fmt.Errorf("unable to list remote messages: %w", err)
 		}
 
 		for _, m := range r.Messages {
@@ -313,13 +352,16 @@ func sync(ctx context.Context, svc *gmail.Service, outputPath string) error {
 					log.Printf("Downloading %v", m.Id)
 				}
 				if !*dryRun {
-					err = downloadMessage(ctx, svc, m.Id, *user, outputPath)
+					msg, err := downloadMessage(ctx, svc, m.Id, *user, outputPath)
 					if err != nil {
-						return fmt.Errorf("unable to retrieve message: %s: %w", m.Id, err)
+						return maxHistoryId, fmt.Errorf("unable to retrieve message: %s: %w", m.Id, err)
+					}
+					if msg.HistoryId > maxHistoryId {
+						maxHistoryId = msg.HistoryId
 					}
 				}
 			} else if *incremental {
-				return nil
+				return maxHistoryId, nil
 			}
 		}
 
@@ -332,14 +374,14 @@ func sync(ctx context.Context, svc *gmail.Service, outputPath string) error {
 	if *delete {
 		f, err := os.Open(outputPath)
 		if err != nil {
-			return err
+			return maxHistoryId, err
 		}
 		defer func() {
 			_ = f.Close()
 		}()
 		localMails, err := f.ReadDir(0)
 		if err != nil {
-			return err
+			return maxHistoryId, err
 		}
 		for _, d := range localMails {
 			k := d.Name()
@@ -354,14 +396,14 @@ func sync(ctx context.Context, svc *gmail.Service, outputPath string) error {
 					path := filepath.Join(outputPath, k)
 					err := os.Remove(path)
 					if err != nil {
-						return fmt.Errorf("delete failed: %w", err)
+						return maxHistoryId, fmt.Errorf("delete failed: %w", err)
 					}
 				}
 			}
 		}
 	}
 
-	return nil
+	return maxHistoryId, nil
 }
 
 func main() {
@@ -392,41 +434,15 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	userConfigDir, err := os.UserConfigDir()
+	svc, err := createService(ctx)
 	if err != nil {
-		log.Fatalf("U: %v", err)
+		log.Fatalf("Unable to create Gmail client: %v", err)
 	}
 
-	credentialsPath := filepath.Join(userConfigDir, "gmbackup", "credentials.json")
-	b, err := os.ReadFile(credentialsPath)
-	config := &defaultConfig
-	if err != nil {
-		if *verbose {
-			log.Printf("Unable to read client secret file: %v", err)
-			log.Println("Using default client credentials")
-		}
-	} else {
-		config, err = google.ConfigFromJSON(b, gmail.GmailReadonlyScope)
-		if err != nil {
-			log.Fatalf("Unable to parse client secret file to config: %v", err)
-		}
-		if *verbose {
-			log.Printf("Using client credentials from: %v", credentialsPath)
-		}
-	}
-
-	client, err := createClient(ctx, config)
-	if err != nil {
-		log.Fatalf("Unable to create client: %v", err)
-	}
-
-	svc, err := gmail.NewService(ctx, option.WithHTTPClient(client))
-	if err != nil {
-		log.Fatalf("Unable to retrieve Gmail client: %v", err)
-	}
-
-	err = sync(ctx, svc, outputPath)
+	historyId, err := sync(ctx, svc, outputPath)
 	if err != nil {
 		log.Fatalf("Unable to sync: %v", err)
 	}
+
+	log.Printf("historyId: %v", historyId)
 }
