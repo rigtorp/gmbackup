@@ -275,28 +275,6 @@ func downloadMessage(ctx context.Context, svc *gmail.Service, id string, user st
 	return nil
 }
 
-func readdir(path string) (fileMap map[string]os.FileInfo, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = f.Close()
-	}()
-
-	files, err := f.Readdir(0)
-	if err != nil {
-		return nil, err
-	}
-
-	fileMap = make(map[string]os.FileInfo)
-	for _, v := range files {
-		fileMap[v.Name()] = v
-	}
-
-	return fileMap, nil
-}
-
 // This secret only identifies the application, it doesn't provide access to any
 // user data.
 var defaultConfig = oauth2.Config{
@@ -313,15 +291,10 @@ var verbose = flag.BoolP("verbose", "v", false, "")
 var incremental = flag.BoolP("incremental", "i", false, "Stop fetching on first existing mail, won't detect deletes")
 
 func sync(ctx context.Context, svc *gmail.Service, outputPath string) error {
-	localMails, err := readdir(outputPath)
-	if err != nil {
-		return fmt.Errorf("unable to list local messages: %w", err)
-	}
-
 	remoteMails := make(map[string]bool)
 	pageToken := ""
 	for {
-		req := svc.Users.Messages.List(*user).MaxResults(500)
+		req := svc.Users.Messages.List(*user).MaxResults(500).Q("-in:CHAT")
 		if pageToken != "" {
 			req.PageToken(pageToken)
 		}
@@ -331,9 +304,11 @@ func sync(ctx context.Context, svc *gmail.Service, outputPath string) error {
 		}
 
 		for _, m := range r.Messages {
-			remoteMails[m.Id] = true
-
-			if localMails[m.Id] == nil {
+			if *delete {
+				remoteMails[m.Id] = true
+			}
+			path := filepath.Join(outputPath, m.Id)
+			if _, err = os.Stat(path); os.IsNotExist(err) {
 				if *verbose {
 					log.Printf("Downloading %v", m.Id)
 				}
@@ -355,7 +330,19 @@ func sync(ctx context.Context, svc *gmail.Service, outputPath string) error {
 	}
 
 	if *delete {
-		for k := range localMails {
+		f, err := os.Open(outputPath)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			_ = f.Close()
+		}()
+		localMails, err := f.ReadDir(0)
+		if err != nil {
+			return err
+		}
+		for _, d := range localMails {
+			k := d.Name()
 			if !remoteMails[k] {
 				if strings.HasPrefix(k, ".") {
 					continue
