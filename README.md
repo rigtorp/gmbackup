@@ -2,7 +2,7 @@
 
 Simple tool to backup a Gmail account.
 
-- Does a full sync using the [Gmail API](https://developers.google.com/gmail/api/guides).
+- Performs full and incremental sync using the [Gmail API](https://developers.google.com/gmail/api/guides).
 - Saves only message contents, not metadata such as labels.
 - Message saved in EML format, which just the raw email data in [RFC2822 format](https://www.rfc-editor.org/rfc/rfc2822).
 - Restore functionality not yet implemented.

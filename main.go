@@ -326,9 +326,35 @@ var delete = flag.BoolP("delete", "d", false, "Delete local mail that has been d
 var dryRun = flag.BoolP("dry-run", "n", false, "Don't make any changes")
 var user = flag.StringP("user", "u", "me", "Gmail account to backup")
 var verbose = flag.BoolP("verbose", "v", false, "")
-var incremental = flag.BoolP("incremental", "i", false, "Stop fetching on first existing mail, won't detect deletes")
+var forceFullSync = flag.BoolP("full-sync", "f", false, "Force full sync")
 
-func sync(ctx context.Context, svc *gmail.Service, outputPath string) (uint64, error) {
+func loadHistoryId(outputPath string) (uint64, error) {
+	path := filepath.Join(outputPath, ".history_id")
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return 0, nil
+	} else if err != nil {
+		return 0, err
+	}
+	var historyId uint64
+	_, err = fmt.Sscanln(string(b), &historyId)
+	return historyId, err
+}
+
+func saveHistoryId(outputPath string, historyId uint64) error {
+	path := filepath.Join(outputPath, ".history_id")
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+	_, err = fmt.Fprintln(f, historyId)
+	return err
+}
+
+func fullSync(ctx context.Context, svc *gmail.Service, outputPath string) (uint64, error) {
 	remoteMails := make(map[string]bool)
 	pageToken := ""
 	maxHistoryId := uint64(0)
@@ -347,6 +373,7 @@ func sync(ctx context.Context, svc *gmail.Service, outputPath string) (uint64, e
 				remoteMails[m.Id] = true
 			}
 			path := filepath.Join(outputPath, m.Id)
+
 			if _, err = os.Stat(path); os.IsNotExist(err) {
 				if *verbose {
 					log.Printf("Downloading %v", m.Id)
@@ -360,8 +387,24 @@ func sync(ctx context.Context, svc *gmail.Service, outputPath string) (uint64, e
 						maxHistoryId = msg.HistoryId
 					}
 				}
-			} else if *incremental {
-				return maxHistoryId, nil
+			} else {
+				if *verbose {
+					log.Printf("Fetching metadata %v", m.Id)
+				}
+				if !*dryRun {
+					msg, err := svc.Users.Messages.Get(*user, m.Id).Format("minimal").Context(ctx).Do()
+					if err != nil {
+						return maxHistoryId, err
+					}
+					path := filepath.Join(outputPath, msg.Id)
+					err = os.Chtimes(path, time.Time{}, time.UnixMilli(msg.InternalDate))
+					if err != nil {
+						return maxHistoryId, err
+					}
+					if msg.HistoryId > maxHistoryId {
+						maxHistoryId = msg.HistoryId
+					}
+				}
 			}
 		}
 
@@ -406,6 +449,59 @@ func sync(ctx context.Context, svc *gmail.Service, outputPath string) (uint64, e
 	return maxHistoryId, nil
 }
 
+func incrementalSync(ctx context.Context, svc *gmail.Service, outputPath string, startHistoryId uint64) (uint64, error) {
+	pageToken := ""
+	historyId := startHistoryId
+	for {
+		req := svc.Users.History.List(*user).StartHistoryId(startHistoryId)
+		if pageToken != "" {
+			req.PageToken(pageToken)
+		}
+		r, err := req.Context(ctx).Do()
+		if err != nil {
+			return 0, fmt.Errorf("unable to list history: %w", err)
+		}
+
+		for _, h := range r.History {
+			for _, ma := range h.MessagesAdded {
+				if *verbose {
+					log.Printf("Downloading %v", ma.Message.Id)
+				}
+				if !*dryRun {
+					_, err := downloadMessage(ctx, svc, ma.Message.Id, *user, outputPath)
+					if err != nil {
+						return 0, fmt.Errorf("unable to retrieve message: %s: %w", ma.Message.Id, err)
+					}
+				}
+			}
+			if *delete {
+				for _, md := range h.MessagesDeleted {
+					if *verbose {
+						log.Printf("Deleting %v", md.Message.Id)
+					}
+					if !*dryRun {
+						path := filepath.Join(outputPath, md.Message.Id)
+						err := os.Remove(path)
+						if err != nil {
+							return 0, fmt.Errorf("delete failed: %w", err)
+						}
+					}
+				}
+			}
+		}
+		if r.HistoryId > historyId {
+			historyId = r.HistoryId
+		}
+
+		if r.NextPageToken == "" {
+			break
+		}
+		pageToken = r.NextPageToken
+	}
+
+	return historyId, nil
+}
+
 func main() {
 
 	flag.Usage = func() {
@@ -439,10 +535,45 @@ func main() {
 		log.Fatalf("Unable to create Gmail client: %v", err)
 	}
 
-	historyId, err := sync(ctx, svc, outputPath)
+	historyId, err := loadHistoryId(outputPath)
 	if err != nil {
-		log.Fatalf("Unable to sync: %v", err)
+		log.Printf("Unable to load history id: %v", err)
 	}
 
-	log.Printf("historyId: %v", historyId)
+	if !*forceFullSync {
+		if *verbose {
+			log.Printf("Starting incremental sync from historyId: %v", historyId)
+		}
+		newHistoryId, err := incrementalSync(ctx, svc, outputPath, historyId)
+		if err != nil {
+			log.Printf("Unable to incremental sync: %v", err)
+			log.Printf("Falling back to full sync")
+			newHistoryId, err = fullSync(ctx, svc, outputPath)
+			if err != nil {
+				log.Fatalf("Unable to sync: %v", err)
+			}
+		}
+		if newHistoryId != 0 {
+			historyId = newHistoryId
+		}
+	} else {
+		if *verbose {
+			log.Printf("Starting full sync")
+		}
+		newHistoryId, err := fullSync(ctx, svc, outputPath)
+		if err != nil {
+			log.Fatalf("Unable to sync: %v", err)
+		}
+		if newHistoryId != 0 {
+			historyId = newHistoryId
+		}
+	}
+
+	if err := saveHistoryId(outputPath, historyId); err != nil {
+		log.Fatalf("Unable to save history id: %v", err)
+	}
+
+	if *verbose {
+		log.Printf("HistoryId for next sync: %v", historyId)
+	}
 }
