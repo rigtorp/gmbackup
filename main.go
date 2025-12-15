@@ -313,21 +313,6 @@ func downloadMessage(ctx context.Context, svc *gmail.Service, id string, user st
 	return msg, nil
 }
 
-// This secret only identifies the application, it doesn't provide access to any
-// user data.
-var defaultConfig = oauth2.Config{
-	ClientID:     "188301361501-76eocf83e1m0946ppeafa6rsu7ub60ss.apps.googleusercontent.com",
-	ClientSecret: "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",
-	Endpoint:     google.Endpoint,
-	Scopes:       []string{gmail.GmailReadonlyScope},
-}
-
-var delete = flag.BoolP("delete", "d", false, "Delete local mail that has been deleted in Gmail")
-var dryRun = flag.BoolP("dry-run", "n", false, "Don't make any changes")
-var user = flag.StringP("user", "u", "me", "Gmail account to backup")
-var verbose = flag.BoolP("verbose", "v", false, "")
-var forceFullSync = flag.BoolP("full-sync", "f", false, "Force full sync")
-
 func loadHistoryId(outputPath string) (uint64, error) {
 	path := filepath.Join(outputPath, ".history_id")
 	b, err := os.ReadFile(path)
@@ -501,6 +486,21 @@ func incrementalSync(ctx context.Context, svc *gmail.Service, outputPath string,
 
 	return historyId, nil
 }
+
+// This secret only identifies the application, it doesn't provide access to any
+// user data.
+var defaultConfig = oauth2.Config{
+	ClientID:     "188301361501-76eocf83e1m0946ppeafa6rsu7ub60ss.apps.googleusercontent.com",
+	ClientSecret: "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",
+	Endpoint:     google.Endpoint,
+	Scopes:       []string{gmail.GmailReadonlyScope},
+}
+
+var delete = flag.Bool("delete", false, "Delete local mail that has been deleted in Gmail")
+var dryRun = flag.BoolP("dry-run", "n", false, "Perform a trial run with no changes made")
+var forceFullSync = flag.Bool("full-sync", false, "Force full sync")
+var user = flag.StringP("user", "u", "me", "Gmail account to backup")
+var verbose = flag.BoolP("verbose", "v", false, "Enable verbose output")
 
 func main() {
 
