@@ -224,19 +224,25 @@ func createService(ctx context.Context) (*gmail.Service, error) {
 
 	credentialsPath := filepath.Join(userConfigDir, "gmbackup", "credentials.json")
 	b, err := os.ReadFile(credentialsPath)
-	config := &defaultConfig
-	if err != nil {
-		if *verbose {
-			log.Printf("Unable to read client secret file: %v", err)
-			log.Println("Using default client credentials")
-		}
-	} else {
+	var config *oauth2.Config
+	if err == nil {
 		config, err = google.ConfigFromJSON(b, gmail.GmailReadonlyScope)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse client secret file: %w", err)
 		}
 		if *verbose {
 			log.Printf("Using client credentials from: %v", credentialsPath)
+		}
+	} else {
+		if *clientID != "" && *clientSecret != "" {
+			config = &defaultConfig
+			config.ClientID = *clientID
+			config.ClientSecret = *clientSecret
+			if *verbose {
+				log.Printf("Using client credentials from flags")
+			}
+		} else {
+			return nil, fmt.Errorf("no credentials found. Please provide credentials.json in %s or use --client-id and --client-secret flags", credentialsPath)
 		}
 	}
 
@@ -487,15 +493,13 @@ func incrementalSync(ctx context.Context, svc *gmail.Service, outputPath string,
 	return historyId, nil
 }
 
-// This secret only identifies the application, it doesn't provide access to any
-// user data.
 var defaultConfig = oauth2.Config{
-	ClientID:     "188301361501-76eocf83e1m0946ppeafa6rsu7ub60ss.apps.googleusercontent.com",
-	ClientSecret: "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",
-	Endpoint:     google.Endpoint,
-	Scopes:       []string{gmail.GmailReadonlyScope},
+	Endpoint: google.Endpoint,
+	Scopes:   []string{gmail.GmailReadonlyScope},
 }
 
+var clientID = flag.String("client-id", "", "Google OAuth2 Client ID")
+var clientSecret = flag.String("client-secret", "", "Google OAuth2 Client Secret")
 var delete = flag.Bool("delete", false, "Delete local mail that has been deleted in Gmail")
 var dryRun = flag.BoolP("dry-run", "n", false, "Perform a trial run with no changes made")
 var forceFullSync = flag.Bool("full-sync", false, "Force full sync")
